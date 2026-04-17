@@ -1,0 +1,32 @@
+__pycache__/
+*.egg-info/
+*.pyc
+dist/
+build/
+.venv/
+.env
+
+# Towelette data and MCP config (project-local, not versioned)
+.towelette/
+.mcp.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Session state
+.remember/
+
+# Claude
+.claude/
