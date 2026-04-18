@@ -176,6 +176,91 @@ def sample_cpp_header(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def sample_cmakelists(tmp_project: Path) -> Path:
+    """Create a sample CMakeLists.txt with find_package and FetchContent."""
+    content = textwrap.dedent("""\
+        cmake_minimum_required(VERSION 3.20)
+        project(MyGeomApp)
+
+        find_package(Eigen3 REQUIRED)
+        find_package(OpenGL REQUIRED)
+
+        include(FetchContent)
+
+        FetchContent_Declare(
+            libigl
+            GIT_REPOSITORY https://github.com/libigl/libigl.git
+            GIT_TAG        v2.5.0
+        )
+        FetchContent_MakeAvailable(libigl)
+    """)
+    p = tmp_project / "CMakeLists.txt"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture
+def sample_conanfile_txt(tmp_project: Path) -> Path:
+    """Create a sample conanfile.txt."""
+    content = textwrap.dedent("""\
+        [requires]
+        eigen/3.4.0
+        fmt/10.1.1
+        # a comment
+        boost/1.83.0@conan/stable
+
+        [generators]
+        CMakeDeps
+        CMakeToolchain
+    """)
+    p = tmp_project / "conanfile.txt"
+    p.write_text(content)
+    return p
+
+
+@pytest.fixture
+def sample_vcpkg_json(tmp_project: Path) -> Path:
+    """Create a sample vcpkg.json."""
+    import json
+    data = {
+        "name": "my-geom-app",
+        "version": "0.1.0",
+        "dependencies": [
+            "eigen3",
+            {"name": "cgal", "version>=": "5.6"},
+        ],
+    }
+    p = tmp_project / "vcpkg.json"
+    p.write_text(json.dumps(data, indent=2))
+    return p
+
+
+@pytest.fixture
+def sample_cpp_source_files(tmp_project: Path) -> Path:
+    """Create sample C++ source files with #include directives."""
+    src = tmp_project / "src"
+    src.mkdir(exist_ok=True)
+    (src / "main.cpp").write_text(textwrap.dedent("""\
+        #include <Eigen/Dense>
+        #include <igl/readOBJ.h>
+        #include <vector>
+        #include <iostream>
+
+        int main() {
+            Eigen::MatrixXd V;
+            return 0;
+        }
+    """))
+    (src / "mesh.h").write_text(textwrap.dedent("""\
+        #pragma once
+        #include <Eigen/Sparse>
+        #include <nlohmann/json.hpp>
+        #include <string>
+    """))
+    return tmp_project
+
+
+@pytest.fixture
 def towelette_dir(tmp_project: Path) -> Path:
     """Create a .towelette directory structure."""
     d = tmp_project / ".towelette"

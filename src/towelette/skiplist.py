@@ -19,6 +19,9 @@ DEFAULT_SKIPLIST: frozenset[str] = frozenset({
     # Standard-ish
     "pydantic", "attrs", "dataclasses", "typing_extensions",
     "loguru", "structlog", "dotenv", "toml", "yaml", "json",
+    # C++ well-known (LLMs already know these)
+    "boost", "zlib", "openssl", "libcurl", "sqlite3",
+    "glfw", "glew", "opengl", "vulkan", "sdl2",
 })
 
 

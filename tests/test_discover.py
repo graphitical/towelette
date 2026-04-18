@@ -152,6 +152,128 @@ class TestDiscoverDeps:
         assert "pyproject.toml" in result.dep_files_found
 
 
+class TestParseCmakelists:
+    def test_finds_find_package_names(self, sample_cmakelists: Path):
+        from towelette.discover import parse_cmakelists
+
+        deps = parse_cmakelists(sample_cmakelists.parent)
+        names = {d.name for d in deps}
+        assert "Eigen3" in names
+        assert "OpenGL" in names
+
+    def test_finds_fetchcontent_name_and_url(self, sample_cmakelists: Path):
+        from towelette.discover import parse_cmakelists
+
+        deps = parse_cmakelists(sample_cmakelists.parent)
+        by_name = {d.name: d for d in deps}
+        assert "libigl" in by_name
+        assert by_name["libigl"].repo_url == "https://github.com/libigl/libigl.git"
+        assert by_name["libigl"].version == "2.5.0"
+
+    def test_returns_empty_when_no_file(self, tmp_path: Path):
+        from towelette.discover import parse_cmakelists
+
+        assert parse_cmakelists(tmp_path) == []
+
+    def test_skips_build_directories(self, tmp_project: Path):
+        from towelette.discover import parse_cmakelists
+
+        build = tmp_project / "build"
+        build.mkdir()
+        (build / "CMakeLists.txt").write_text("find_package(ShouldBeIgnored REQUIRED)\n")
+        (tmp_project / "CMakeLists.txt").write_text("find_package(RealDep REQUIRED)\n")
+
+        deps = parse_cmakelists(tmp_project)
+        names = {d.name for d in deps}
+        assert "RealDep" in names
+        assert "ShouldBeIgnored" not in names
+
+
+class TestParseConanfile:
+    def test_parses_requires(self, sample_conanfile_txt: Path):
+        from towelette.discover import parse_conanfile
+
+        deps = parse_conanfile(sample_conanfile_txt.parent)
+        names = {d.name for d in deps}
+        assert "eigen" in names
+        assert "fmt" in names
+
+    def test_extracts_version(self, sample_conanfile_txt: Path):
+        from towelette.discover import parse_conanfile
+
+        deps = parse_conanfile(sample_conanfile_txt.parent)
+        by_name = {d.name: d for d in deps}
+        assert by_name["eigen"].version == "3.4.0"
+
+    def test_strips_user_channel(self, sample_conanfile_txt: Path):
+        from towelette.discover import parse_conanfile
+
+        deps = parse_conanfile(sample_conanfile_txt.parent)
+        names = {d.name for d in deps}
+        assert "boost" in names
+        # Confirm @conan/stable was stripped (no @ in name)
+        assert not any("@" in n for n in names)
+
+    def test_returns_empty_when_no_file(self, tmp_path: Path):
+        from towelette.discover import parse_conanfile
+
+        assert parse_conanfile(tmp_path) == []
+
+
+class TestParseVcpkgJson:
+    def test_parses_string_deps(self, sample_vcpkg_json: Path):
+        from towelette.discover import parse_vcpkg_json
+
+        deps = parse_vcpkg_json(sample_vcpkg_json.parent)
+        names = {d.name for d in deps}
+        assert "eigen3" in names
+
+    def test_parses_object_deps_with_version(self, sample_vcpkg_json: Path):
+        from towelette.discover import parse_vcpkg_json
+
+        deps = parse_vcpkg_json(sample_vcpkg_json.parent)
+        by_name = {d.name: d for d in deps}
+        assert "cgal" in by_name
+        assert by_name["cgal"].version == "5.6"
+
+    def test_returns_empty_when_no_file(self, tmp_path: Path):
+        from towelette.discover import parse_vcpkg_json
+
+        assert parse_vcpkg_json(tmp_path) == []
+
+    def test_returns_empty_on_malformed_json(self, tmp_path: Path):
+        from towelette.discover import parse_vcpkg_json
+
+        (tmp_path / "vcpkg.json").write_text("{ not valid json")
+        assert parse_vcpkg_json(tmp_path) == []
+
+
+class TestScanIncludes:
+    def test_finds_system_includes(self, sample_cpp_source_files: Path):
+        from towelette.discover import scan_includes
+
+        packages = scan_includes(sample_cpp_source_files)
+        assert "eigen3" in packages
+        assert "libigl" in packages
+
+    def test_maps_to_package_names(self, sample_cpp_source_files: Path):
+        from towelette.discover import scan_includes
+
+        packages = scan_includes(sample_cpp_source_files)
+        # Eigen/ -> eigen3, igl/ -> libigl
+        assert "Eigen" not in packages
+        assert "igl" not in packages
+        assert "nlohmann-json" in packages
+
+    def test_filters_stdlib(self, sample_cpp_source_files: Path):
+        from towelette.discover import scan_includes
+
+        packages = scan_includes(sample_cpp_source_files)
+        assert "vector" not in packages
+        assert "iostream" not in packages
+        assert "string" not in packages
+
+
 class TestResolveRepoUrl:
     @requires_network
     @pytest.mark.asyncio

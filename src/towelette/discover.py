@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import sys
 from pathlib import Path
@@ -45,6 +46,169 @@ _IMPORT_TO_PACKAGE: dict[str, str] = {
     "attr": "attrs",
     "gi": "PyGObject",
 }
+
+_CXX_STDLIB: frozenset[str] = frozenset({
+    "algorithm", "any", "array", "atomic", "barrier", "bit", "bitset",
+    "cassert", "cctype", "cerrno", "cfenv", "cfloat", "charconv",
+    "chrono", "cinttypes", "climits", "clocale", "cmath", "codecvt",
+    "compare", "complex", "concepts", "condition_variable", "coroutine",
+    "csetjmp", "csignal", "cstdarg", "cstddef", "cstdint", "cstdio",
+    "cstdlib", "cstring", "ctime", "cuchar", "cwchar", "cwctype",
+    "deque", "exception", "execution", "expected", "filesystem",
+    "format", "forward_list", "fstream", "functional", "future",
+    "initializer_list", "iomanip", "ios", "iosfwd", "iostream",
+    "istream", "iterator", "latch", "limits", "list", "locale",
+    "map", "memory", "memory_resource", "mutex", "new", "numbers",
+    "numeric", "optional", "ostream", "print", "queue", "random",
+    "ranges", "ratio", "regex", "scoped_allocator", "semaphore", "set",
+    "shared_mutex", "source_location", "span", "spanstream", "sstream",
+    "stack", "stacktrace", "stdexcept", "stop_token", "streambuf",
+    "string", "string_view", "strstream", "syncstream", "system_error",
+    "thread", "tuple", "type_traits", "typeindex", "typeinfo",
+    "unordered_map", "unordered_set", "utility", "valarray", "variant",
+    "vector", "version",
+    # C compat headers
+    "assert.h", "ctype.h", "errno.h", "float.h", "limits.h",
+    "locale.h", "math.h", "setjmp.h", "signal.h", "stdarg.h",
+    "stddef.h", "stdio.h", "stdlib.h", "string.h", "time.h",
+})
+
+_INCLUDE_TO_PACKAGE: dict[str, str] = {
+    # Geometry / math
+    "Eigen": "eigen3",
+    "igl": "libigl",
+    "CGAL": "cgal",
+    "geometrycentral": "geometry-central",
+    "glm": "glm",
+    "polyscope": "polyscope",
+    "OpenMesh": "openmesh",
+    "assimp": "assimp",
+    "VCG": "vcglib",
+    # General
+    "boost": "boost",
+    "nlohmann": "nlohmann-json",
+    "spdlog": "spdlog",
+    "fmt": "fmt",
+    "pybind11": "pybind11",
+}
+
+_CMAKE_SKIP_DIRS: frozenset[str] = frozenset({
+    "build", "cmake-build-debug", "cmake-build-release",
+    "cmake-build-relwithdebinfo", "cmake-build-minsizerel",
+    "CMakeFiles", ".cmake",
+})
+
+
+def parse_cmakelists(project_root: Path) -> list[DependencyCandidate]:
+    deps: list[DependencyCandidate] = []
+    seen: set[str] = set()
+
+    for cmake_file in project_root.rglob("CMakeLists.txt"):
+        if any(part in _CMAKE_SKIP_DIRS for part in cmake_file.parts):
+            continue
+        text = cmake_file.read_text(errors="replace")
+
+        for name in re.findall(r"find_package\s*\(\s*(\w+)", text):
+            key = name.lower().replace("-", "_")
+            if key not in seen:
+                seen.add(key)
+                deps.append(DependencyCandidate(name=name))
+
+        for block in re.finditer(r"FetchContent_Declare\s*\(\s*(\w+)(.*?)\)", text, re.DOTALL | re.IGNORECASE):
+            name = block.group(1)
+            body = block.group(2)
+            key = name.lower().replace("-", "_")
+            url_m = re.search(r"GIT_REPOSITORY\s+([^\s\)]+)", body)
+            tag_m = re.search(r"GIT_TAG\s+([^\s\)]+)", body)
+            repo_url = url_m.group(1) if url_m else None
+            version = _parse_version(tag_m.group(1)) if tag_m else None
+            if key not in seen:
+                seen.add(key)
+                deps.append(DependencyCandidate(name=name, version=version, repo_url=repo_url))
+
+    return deps
+
+
+def parse_conanfile(project_root: Path) -> list[DependencyCandidate]:
+    path = project_root / "conanfile.txt"
+    if not path.exists():
+        return []
+
+    deps: list[DependencyCandidate] = []
+    seen: set[str] = set()
+    in_requires = False
+
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_requires = line == "[requires]"
+            continue
+        if not in_requires or not line or line.startswith("#"):
+            continue
+        # Strip @user/channel suffix, then split name/version
+        line = re.sub(r"@[^\s]+", "", line).strip()
+        parts = line.split("/")
+        name = parts[0].strip()
+        version = parts[1].strip() if len(parts) > 1 else None
+        key = name.lower().replace("-", "_")
+        if name and key not in seen:
+            seen.add(key)
+            deps.append(DependencyCandidate(name=name, version=version))
+
+    return deps
+
+
+def parse_vcpkg_json(project_root: Path) -> list[DependencyCandidate]:
+    path = project_root / "vcpkg.json"
+    if not path.exists():
+        return []
+
+    deps: list[DependencyCandidate] = []
+    seen: set[str] = set()
+
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    for item in data.get("dependencies", []):
+        if isinstance(item, str):
+            name, version = item, None
+        elif isinstance(item, dict):
+            name = item.get("name", "")
+            version = item.get("version>=") or item.get("version") or None
+        else:
+            continue
+        key = name.lower().replace("-", "_")
+        if name and key not in seen:
+            seen.add(key)
+            deps.append(DependencyCandidate(name=name, version=version))
+
+    return deps
+
+
+def scan_includes(project_root: Path) -> set[str]:
+    packages: set[str] = set()
+    extensions = {".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"}
+    skip_dirs = {".venv", "venv", "node_modules", ".towelette", "__pycache__", ".git"} | _CMAKE_SKIP_DIRS
+
+    for src_file in project_root.rglob("*"):
+        if src_file.suffix not in extensions:
+            continue
+        if any(part in skip_dirs for part in src_file.parts):
+            continue
+        try:
+            text = src_file.read_text(errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r'#include\s*<([^>]+)>', text):
+            header = m.group(1)
+            top = header.split("/")[0]
+            if top in _CXX_STDLIB:
+                continue
+            package = _INCLUDE_TO_PACKAGE.get(top, top)
+            packages.add(package)
+
+    return packages
 
 
 def _parse_version(spec: str) -> str | None:
@@ -203,6 +367,8 @@ def discover_deps(
         (parse_pyproject, ["pyproject.toml"]),
         (parse_environment_yml, ["environment.yml", "environment.dev.yml"]),
         (parse_requirements, ["requirements.txt", "requirements-dev.txt"]),
+        (parse_conanfile, ["conanfile.txt"]),
+        (parse_vcpkg_json, ["vcpkg.json"]),
     ]:
         for fname in filenames:
             if (project_root / fname).exists():
@@ -212,8 +378,16 @@ def discover_deps(
             if key not in all_deps:
                 all_deps[key] = dep
 
+    # CMakeLists.txt may appear in subdirectories, so check separately
+    if any(True for _ in project_root.rglob("CMakeLists.txt")):
+        dep_files_found.append("CMakeLists.txt")
+    for dep in parse_cmakelists(project_root):
+        key = dep.name.lower().replace("-", "_")
+        if key not in all_deps:
+            all_deps[key] = dep
+
     local_modules = _local_module_names(project_root)
-    imported = scan_imports(project_root)
+    imported = scan_imports(project_root) | scan_includes(project_root)
     for imp_name in imported:
         key = imp_name.lower().replace("-", "_")
         if key in local_modules:
