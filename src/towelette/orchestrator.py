@@ -21,6 +21,7 @@ from pathlib import Path
 
 import chromadb
 
+from towelette.backends import ScoutBackend, get_backend
 from towelette.config import load_config, save_library_config
 from towelette.index import index_cpp_source, index_python_source
 from towelette.models import DependencyCandidate, IndexStrategy, ScoutReport
@@ -34,84 +35,14 @@ def _dispatch_one_scout(
     imports: list[str],
     model: str = "haiku",
 ) -> ScoutReport:
-    """Dispatch a single scout as a subprocess.
+    """Backward-compat shim — delegates to :class:`~towelette.backends.claude.ClaudeBackend`.
 
-    Spawns `claude` CLI as a subprocess with the scout prompt. The scout
-    clones the repo, explores it, and returns a TOML report.
-
-    Falls back to a minimal error report if the subprocess fails.
+    .. deprecated::
+        Import :class:`~towelette.backends.claude.ClaudeBackend` directly or
+        use :func:`get_backend` / :func:`run_scouts` instead.
     """
-    prompt = build_scout_prompt(candidate, imports, repos_dir=str(repos_dir))
-
-    stderr_lines: list[str] = []
-
-    def _stream_stderr(pipe) -> None:
-        for line in pipe:
-            stderr_lines.append(line)
-            print(f"  [scout:{candidate.name}] {line}", end="", flush=True)
-
-    try:
-        proc = subprocess.Popen(
-            [
-                "claude",
-                "--print",
-                "--model", model,
-                "--strict-mcp-config",  # ignore project .mcp.json -- prevents MCP tool bloat
-                "--no-session-persistence",
-                "--allowedTools", "Bash,Read,LS,Glob,Grep,WebFetch,WebSearch",
-                "--verbose",
-                "-p", prompt,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=Path.home(),        # neutral cwd -- prevents project CLAUDE.md from loading
-        )
-        stderr_thread = threading.Thread(target=_stream_stderr, args=(proc.stderr,), daemon=True)
-        stderr_thread.start()
-        try:
-            stdout, _ = proc.communicate(timeout=300)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            return ScoutReport(
-                library=candidate.name,
-                repo=candidate.repo_url,
-                version=candidate.version,
-                error="Scout timed out after 300s",
-            )
-        stderr_thread.join()
-
-        if proc.returncode == 0 and stdout.strip():
-            return parse_scout_report(stdout)
-        else:
-            combined = ("".join(stderr_lines) + stdout).lower()
-            if "prompt is too long" in combined:
-                hint = (
-                    f"Scout prompt exceeded {model}'s context limit. "
-                    f"Set scout_model = \"sonnet\" in .towelette/config.toml to use a larger context "
-                    f"(higher token usage)."
-                )
-                return ScoutReport(
-                    library=candidate.name,
-                    repo=candidate.repo_url,
-                    version=candidate.version,
-                    error=hint,
-                )
-            stderr_tail = "".join(stderr_lines)[-200:]
-            return ScoutReport(
-                library=candidate.name,
-                repo=candidate.repo_url,
-                version=candidate.version,
-                error=f"Scout subprocess failed (exit {proc.returncode}): {stderr_tail}",
-            )
-    except FileNotFoundError:
-        return ScoutReport(
-            library=candidate.name,
-            repo=candidate.repo_url,
-            version=candidate.version,
-            error="claude CLI not found -- install Claude Code to dispatch scouts",
-        )
+    from towelette.backends.claude import ClaudeBackend
+    return ClaudeBackend(model=model).scout(candidate, repos_dir, imports)
 
 
 def _reports_dir(towelette_dir: Path) -> Path:
@@ -201,14 +132,15 @@ def run_scouts(
         # Resolve repo URLs in parallel
         resolved = asyncio.run(resolve_candidates(to_scout))
 
+        backend = get_backend(config)
+
         with ThreadPoolExecutor(max_workers=max_parallel) as pool:
             futures = {
                 pool.submit(
-                    _dispatch_one_scout,
+                    backend.scout,
                     candidate,
                     repos_dir,
                     imports.get(candidate.name, []),
-                    scout_model,
                 ): candidate
                 for candidate in resolved
             }
@@ -260,14 +192,14 @@ def run_scouts(
 
     if upstream_candidates:
         upstream_resolved = asyncio.run(resolve_candidates(upstream_candidates))
+        upstream_backend = get_backend(config)
         with ThreadPoolExecutor(max_workers=max_parallel) as pool:
             futures = {
                 pool.submit(
-                    _dispatch_one_scout,
+                    upstream_backend.scout,
                     candidate,
                     repos_dir,
                     imports.get(candidate.name, []),
-                    scout_model,
                 ): candidate
                 for candidate in upstream_resolved
             }
@@ -460,14 +392,16 @@ def index_project(
 
 
 def write_mcp_config(project_root: Path) -> None:
-    """Write MCP server config to both .mcp.json and .claude/settings.json.
+    """Write MCP server config to .mcp.json (always) and optionally to
+    .claude/settings.json.
 
-    .mcp.json (project root) is what Claude Code reads for MCP server discovery.
-    .claude/settings.json is written for completeness / other tooling.
+    .mcp.json (project root) is the universal MCP discovery file.
+    .claude/settings.json is only updated when the .claude/ directory already
+    exists — it is **not** created if absent.
     """
     mcp_entry = {"command": "towelette", "args": ["serve"]}
 
-    # .mcp.json -- primary: this is what Claude Code's /mcp dialog reads
+    # .mcp.json -- universal: always written
     mcp_json_path = project_root / ".mcp.json"
     if mcp_json_path.exists():
         mcp_config = json.loads(mcp_json_path.read_text())
@@ -478,18 +412,18 @@ def write_mcp_config(project_root: Path) -> None:
     mcp_config["mcpServers"]["towelette"] = mcp_entry
     mcp_json_path.write_text(json.dumps(mcp_config, indent=2) + "\n")
 
-    # .claude/settings.json -- secondary: for permissions/hooks config
+    # .claude/settings.json -- only update if .claude/ already exists
     claude_dir = project_root / ".claude"
-    claude_dir.mkdir(exist_ok=True)
-    settings_path = claude_dir / "settings.json"
-    if settings_path.exists():
-        settings = json.loads(settings_path.read_text())
-    else:
-        settings = {}
-    if "mcpServers" not in settings:
-        settings["mcpServers"] = {}
-    settings["mcpServers"]["towelette"] = mcp_entry
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    if claude_dir.is_dir():
+        settings_path = claude_dir / "settings.json"
+        if settings_path.exists():
+            settings = json.loads(settings_path.read_text())
+        else:
+            settings = {}
+        if "mcpServers" not in settings:
+            settings["mcpServers"] = {}
+        settings["mcpServers"]["towelette"] = mcp_entry
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
 
 
 def add_to_gitignore(project_root: Path) -> None:

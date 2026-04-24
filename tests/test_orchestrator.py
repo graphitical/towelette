@@ -86,16 +86,40 @@ class TestIndexProject:
 
 
 class TestWriteMcpConfig:
-    def test_writes_claude_settings(self, project_with_lib):
+    def test_writes_mcp_json(self, project_with_lib):
+        """write_mcp_config always writes .mcp.json."""
         from towelette.orchestrator import write_mcp_config
+        import json
 
         project_root, towelette_dir = project_with_lib
         write_mcp_config(project_root)
 
+        mcp_json_path = project_root / ".mcp.json"
+        assert mcp_json_path.exists()
+        config = json.loads(mcp_json_path.read_text())
+        assert "mcpServers" in config
+        assert "towelette" in config["mcpServers"]
+
+    def test_does_not_create_claude_dir(self, project_with_lib):
+        """write_mcp_config must NOT create .claude/ if it doesn't exist."""
+        from towelette.orchestrator import write_mcp_config
+
+        project_root, towelette_dir = project_with_lib
+        assert not (project_root / ".claude").exists()
+        write_mcp_config(project_root)
+        assert not (project_root / ".claude").exists()
+
+    def test_updates_claude_settings_when_dir_exists(self, project_with_lib):
+        """write_mcp_config updates .claude/settings.json when .claude/ already exists."""
+        from towelette.orchestrator import write_mcp_config
+        import json
+
+        project_root, towelette_dir = project_with_lib
+        (project_root / ".claude").mkdir()
+        write_mcp_config(project_root)
+
         settings_path = project_root / ".claude" / "settings.json"
         assert settings_path.exists()
-
-        import json
         settings = json.loads(settings_path.read_text())
         assert "mcpServers" in settings
         assert "towelette" in settings["mcpServers"]
@@ -110,8 +134,57 @@ def _make_mock_proc(stdout: str, returncode: int = 0, stderr_lines: list[str] | 
     return proc
 
 
-class TestDispatchOneScout:
+class TestClaudeBackend:
+    """Tests for ClaudeBackend (previously _dispatch_one_scout)."""
+
     def test_parses_successful_subprocess(self):
+        from towelette.backends.claude import ClaudeBackend
+
+        candidate = DependencyCandidate(name="mylib", version="1.0.0", repo_url="https://github.com/user/mylib")
+        toml_output = textwrap.dedent("""\
+            [report]
+            library = "mylib"
+            strategy = "python_ast"
+            source_paths = ["mylib/"]
+            estimated_chunks = 50
+            notes = "Simple Python lib"
+        """)
+
+        mock_proc = _make_mock_proc(stdout=toml_output, returncode=0)
+        with patch("towelette.backends.claude.subprocess.Popen", return_value=mock_proc):
+            report = ClaudeBackend().scout(candidate, Path("/tmp/repos"), [])
+
+        assert report.library == "mylib"
+        assert report.strategy == "python_ast"
+        assert report.error is None
+
+    def test_returns_error_on_subprocess_failure(self):
+        from towelette.backends.claude import ClaudeBackend
+
+        candidate = DependencyCandidate(name="mylib", version="1.0.0")
+
+        mock_proc = _make_mock_proc(stdout="", returncode=1, stderr_lines=["something broke\n"])
+        with patch("towelette.backends.claude.subprocess.Popen", return_value=mock_proc):
+            report = ClaudeBackend().scout(candidate, Path("/tmp/repos"), [])
+
+        assert report.error is not None
+
+    def test_returns_error_when_claude_not_found(self):
+        from towelette.backends.claude import ClaudeBackend
+
+        candidate = DependencyCandidate(name="mylib")
+
+        with patch("towelette.backends.claude.subprocess.Popen", side_effect=FileNotFoundError):
+            report = ClaudeBackend().scout(candidate, Path("/tmp/repos"), [])
+
+        assert report.error is not None
+        assert "claude CLI not found" in report.error
+
+
+class TestDispatchOneScout:
+    """Backward-compat shim — delegates to ClaudeBackend."""
+
+    def test_shim_delegates_to_claude_backend(self):
         from towelette.orchestrator import _dispatch_one_scout
 
         candidate = DependencyCandidate(name="mylib", version="1.0.0", repo_url="https://github.com/user/mylib")
@@ -125,34 +198,11 @@ class TestDispatchOneScout:
         """)
 
         mock_proc = _make_mock_proc(stdout=toml_output, returncode=0)
-        with patch("towelette.orchestrator.subprocess.Popen", return_value=mock_proc):
+        with patch("towelette.backends.claude.subprocess.Popen", return_value=mock_proc):
             report = _dispatch_one_scout(candidate, Path("/tmp/repos"), [])
 
         assert report.library == "mylib"
-        assert report.strategy == "python_ast"
         assert report.error is None
-
-    def test_returns_error_on_subprocess_failure(self):
-        from towelette.orchestrator import _dispatch_one_scout
-
-        candidate = DependencyCandidate(name="mylib", version="1.0.0")
-
-        mock_proc = _make_mock_proc(stdout="", returncode=1, stderr_lines=["something broke\n"])
-        with patch("towelette.orchestrator.subprocess.Popen", return_value=mock_proc):
-            report = _dispatch_one_scout(candidate, Path("/tmp/repos"), [])
-
-        assert report.error is not None
-
-    def test_returns_error_when_claude_not_found(self):
-        from towelette.orchestrator import _dispatch_one_scout
-
-        candidate = DependencyCandidate(name="mylib")
-
-        with patch("towelette.orchestrator.subprocess.Popen", side_effect=FileNotFoundError):
-            report = _dispatch_one_scout(candidate, Path("/tmp/repos"), [])
-
-        assert report.error is not None
-        assert "claude CLI not found" in report.error
 
 
 class TestRunScouts:
@@ -178,13 +228,16 @@ class TestRunScouts:
         trimesh_report = ScoutReport(library="trimesh", strategy="python_ast", source_paths=["trimesh/"], estimated_chunks=800)
         mylib_report = ScoutReport(library="mylib", strategy="python_ast", source_paths=["mylib/"], estimated_chunks=50)
 
-        def fake_dispatch(candidate, repos_dir, imports):
+        def fake_scout(candidate, repos_dir, imports):
             if candidate.name == "trimesh":
                 return trimesh_report
             return mylib_report
 
+        mock_backend = MagicMock()
+        mock_backend.scout.side_effect = fake_scout
+
         with patch("towelette.orchestrator.asyncio.run", side_effect=lambda coro: candidates), \
-             patch("towelette.orchestrator._dispatch_one_scout", side_effect=fake_dispatch):
+             patch("towelette.orchestrator.get_backend", return_value=mock_backend):
             reports = run_scouts(towelette_dir, candidates)
 
         assert len(reports) == 2
@@ -223,7 +276,7 @@ class TestRunScouts:
 
         call_count = {"n": 0}
 
-        def fake_dispatch(candidate, repos_dir, imports, model="haiku"):
+        def fake_scout(candidate, repos_dir, imports):
             call_count["n"] += 1
             if candidate.name == "potpourri3d":
                 return potpourri_report
@@ -241,8 +294,11 @@ class TestRunScouts:
                 return candidates
             return [upstream_candidate]
 
+        mock_backend = MagicMock()
+        mock_backend.scout.side_effect = fake_scout
+
         with patch("towelette.orchestrator.asyncio.run", side_effect=fake_asyncio_run), \
-             patch("towelette.orchestrator._dispatch_one_scout", side_effect=fake_dispatch):
+             patch("towelette.orchestrator.get_backend", return_value=mock_backend):
             reports = run_scouts(towelette_dir, candidates)
 
         assert call_count["n"] == 2
@@ -273,12 +329,15 @@ class TestRunScouts:
 
         call_count = {"n": 0}
 
-        def fake_dispatch(candidate, repos_dir, imports, model="haiku"):
+        def fake_scout(candidate, repos_dir, imports):
             call_count["n"] += 1
             return somelib_report
 
+        mock_backend = MagicMock()
+        mock_backend.scout.side_effect = fake_scout
+
         with patch("towelette.orchestrator.asyncio.run", side_effect=lambda coro: candidates), \
-             patch("towelette.orchestrator._dispatch_one_scout", side_effect=fake_dispatch):
+             patch("towelette.orchestrator.get_backend", return_value=mock_backend):
             reports = run_scouts(towelette_dir, candidates)
 
         assert call_count["n"] == 1
@@ -309,12 +368,15 @@ class TestRunScouts:
 
         call_count = {"n": 0}
 
-        def fake_dispatch(candidate, repos_dir, imports, model="haiku"):
+        def fake_scout(candidate, repos_dir, imports):
             call_count["n"] += 1
             return somelib_report
 
+        mock_backend = MagicMock()
+        mock_backend.scout.side_effect = fake_scout
+
         with patch("towelette.orchestrator.asyncio.run", side_effect=lambda coro: candidates), \
-             patch("towelette.orchestrator._dispatch_one_scout", side_effect=fake_dispatch):
+             patch("towelette.orchestrator.get_backend", return_value=mock_backend):
             reports = run_scouts(towelette_dir, candidates)
 
         # pydantic must not have triggered a scout dispatch

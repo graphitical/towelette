@@ -15,9 +15,18 @@ _DEFAULT_CONFIG = """\
 [settings]
 tool_prefix = "towelette"
 chunk_limit = 8000
+# scout_backend selects the dispatch strategy: auto | local | claude | generic
+# auto  -- try local heuristics first; escalate to claude when uncertain (default)
+# local -- heuristic-only, no LLM required (fast, lower quality)
+# claude -- original claude --print dispatch (requires Claude Code CLI)
+# generic -- shell out to a custom command; set scout_command below
+scout_backend = "auto"
 # scout_model controls which Claude model scouts use. "haiku" is cheapest.
 # If scouts fail with "Prompt is too long", set this to "sonnet" (higher token usage).
 scout_model = "haiku"
+# scout_command is used only when scout_backend = "generic".
+# Use {prompt} as a placeholder: e.g. scout_command = "codex -q '{prompt}'"
+scout_command = ""
 # upstream_chase = true enables scouting of upstream dependencies recommended by scouts.
 # Disabled by default -- most libraries don't have upstream deps worth indexing.
 upstream_chase = false

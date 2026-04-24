@@ -84,11 +84,15 @@ class TestInitIntegration:
         result = runner.invoke(app, ["init", str(project_with_deps), "--skip-scouts"])
         assert result.exit_code == 0
 
-        settings_path = project_with_deps / ".claude" / "settings.json"
-        assert settings_path.exists()
-        settings = json.loads(settings_path.read_text())
-        assert "mcpServers" in settings
-        assert "towelette" in settings["mcpServers"]
+        # .mcp.json is always written
+        mcp_json_path = project_with_deps / ".mcp.json"
+        assert mcp_json_path.exists()
+        config = json.loads(mcp_json_path.read_text())
+        assert "mcpServers" in config
+        assert "towelette" in config["mcpServers"]
+
+        # .claude/ is NOT created if it didn't already exist
+        assert not (project_with_deps / ".claude").exists()
 
 
 class TestResetCommand:
