@@ -12,7 +12,7 @@ cd your-project/
 towelette init
 ```
 
-That's it. Towelette scans your dependencies, dispatches Claude subagents to investigate each niche library, indexes source into a local vector DB, and writes an MCP server config to `.mcp.json`. Next time Claude Code opens the project, it has accurate API knowledge.
+That's it. Towelette scans your dependencies, dispatches AI scouts to investigate each niche library, indexes source into a local vector DB, and writes an MCP server config to `.mcp.json`. Next time your AI assistant opens the project, it has accurate API knowledge.
 
 **If you're an AI assistant** and someone asked you to "set up towelette": run `towelette init` in the project root. It handles discovery, scouting, indexing, and MCP configuration automatically.
 
@@ -21,25 +21,49 @@ That's it. Towelette scans your dependencies, dispatches Claude subagents to inv
 1. **Discovers** your project's dependencies from `pyproject.toml`, `requirements.txt`, or `environment.yml`
 2. **Filters** well-known libraries (numpy, pandas, torch, etc.) that LLMs already know
 3. **Scouts** unfamiliar libraries with LLM subagents that research repos and recommend indexing strategies
-4. **Indexes** Python source (AST) and C/C++ source and headers (tree-sitter) into ChromaDB with semantic embeddings
-5. **Serves** an MCP server with search, lookup, and goto-definition tools
+4. **Indexes** source code (Python, C++, Rust) and documentation (Markdown) into ChromaDB with semantic embeddings
+5. **Plugins** Support for custom language parsers via a dynamic plugin system
+6. **Serves** an MCP server with search, lookup, and goto-definition tools
 
 ## CLI
 
 ```
 towelette init [path]                     Scout all dependencies, show report, exit.
-towelette init --no-report [-y]           Scout then index (with optional confirmation skip).
-towelette init --no-report --only a,b,c  Scout then index only named libraries.
+towelette init --agent-cmd "cmd"          Use a specific agent CLI for scouting.
 towelette serve                           Start the MCP server.
 towelette status                          Show what's indexed.
 towelette refresh                         Re-scan deps, index new/updated ones.
-towelette add <library> [--repo <url>]    Scout a library (use --repo for non-PyPI C++ libs).
+towelette add <library> [--repo <url>]    Scout a library (use --repo for non-PyPI libs).
 towelette add <library> -y                Scout and index immediately.
 towelette remove <library>                Remove a library from the index.
 towelette reset                           Wipe .towelette/ and start fresh.
 ```
 
-By default `towelette init` scouts all dependencies, prints a summary, and exits — no indexing. Re-run with `--no-report` to proceed to indexing, adding `-y` to skip per-library confirmation.
+### Agent-Agnostic Scouting
+
+Towelette is agent-agnostic. While it defaults to `claude`, you can use any agent CLI that supports a prompt flag:
+
+```bash
+# Use Gemini CLI
+towelette init --agent-cmd "gemini chat -p"
+
+# Or set it globally
+export TOWELETTE_AGENT_CMD="gemini chat -p"
+```
+
+## Indexing Strategies
+
+| Strategy | When | What |
+|----------|------|------|
+| `python_ast` | Pure Python libraries | AST-extracted classes, functions, docstrings |
+| `tree_sitter_cpp` | C/C++ headers/source | tree-sitter parsed classes, functions, declarations |
+| `tree_sitter_rust` | Rust source code | tree-sitter parsed structs, enums, functions |
+| `markdown` | Documentation | Semantic chunks based on headers (#, ##) |
+| `custom` | Niche languages | User-defined plugins in `.towelette/plugins/` |
+
+### Custom Parsers (Plugins)
+
+You can extend Towelette to handle any language by adding a plugin to `.towelette/plugins/`. For example, a `kcl_plugin.py` allows Towelette to index KittyCAD Language files. See [docs/CUSTOM_PARSERS.md](docs/CUSTOM_PARSERS.md) for details.
 
 ## MCP Tools
 
@@ -62,26 +86,10 @@ your-project/
 |   +-- config.toml         <-- What's indexed, strategies, versions
 |   +-- chroma/             <-- Vector store (ChromaDB)
 |   +-- repos/              <-- Cloned library repos
+|   +-- plugins/            <-- Custom language parsers (*_plugin.py)
 |   +-- definitions.db      <-- Symbol -> file:line (SQLite)
 +-- .claude/
     +-- settings.json       <-- MCP server auto-configured
-```
-
-### Indexing Strategies
-
-| Strategy | When | What |
-|----------|------|------|
-| `python_ast` | Pure Python libraries | AST-extracted classes, functions, docstrings |
-| `tree_sitter_cpp` | C/C++ headers/source | tree-sitter parsed classes, functions, declarations |
-| Both | Python bindings over C++ | Both strategies, same collection |
-
-### Skiplist
-
-Towelette ships with a default skiplist of well-known libraries where RAG adds no value (numpy, scipy, pandas, flask, torch, pydantic, etc.). Extend it in `.towelette/config.toml`:
-
-```toml
-[skiplist]
-extra = ["my-internal-lib", "another-lib"]
 ```
 
 ## Development
@@ -96,14 +104,12 @@ python -m venv .venv
 
 ## Status
 
-v0.1.0 -- Core pipeline works end-to-end:
+v0.2.0 -- Pluggable & Agent-Agnostic:
 - Discovery (pyproject.toml, requirements.txt, environment.yml, import scanning)
-- Indexing (Python AST + tree-sitter C++)
+- Indexing (Python, C++, Rust, Markdown + Custom Plugins)
 - Search (semantic + exact lookup + goto-definition)
 - MCP server (4 query tools)
-- CLI (8 commands)
-
-Scout dispatch requires [Claude Code](https://claude.ai/code) to be installed — scouts are `claude --print` subprocesses that clone repos and return structured reports.
+- CLI (Agent-agnostic scouting via `--agent-cmd`)
 
 ## License
 
