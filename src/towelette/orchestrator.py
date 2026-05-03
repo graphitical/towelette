@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import os
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,7 +23,13 @@ from pathlib import Path
 import chromadb
 
 from towelette.config import load_config, save_library_config
-from towelette.index import index_cpp_source, index_python_source
+from towelette.index import (
+    index_cpp_source,
+    index_custom_source,
+    index_markdown_source,
+    index_python_source,
+    index_rust_source,
+)
 from towelette.models import DependencyCandidate, IndexStrategy, ScoutReport
 from towelette.scout import build_scout_prompt, parse_scout_report
 from towelette.skiplist import should_skip
@@ -33,15 +40,31 @@ def _dispatch_one_scout(
     repos_dir: Path,
     imports: list[str],
     model: str = "haiku",
+    agent_cmd: str | None = None,
 ) -> ScoutReport:
     """Dispatch a single scout as a subprocess.
 
-    Spawns `claude` CLI as a subprocess with the scout prompt. The scout
-    clones the repo, explores it, and returns a TOML report.
-
-    Falls back to a minimal error report if the subprocess fails.
+    Spawns an agent CLI as a subprocess with the scout prompt.
+    Defaults to `claude` if agent_cmd is not provided.
     """
     prompt = build_scout_prompt(candidate, imports, repos_dir=str(repos_dir))
+
+    # Determine command structure based on agent
+    if agent_cmd:
+        # User-provided command, split and append prompt
+        # We assume the last arg is the prompt or it's piped
+        full_cmd = agent_cmd.split() + [prompt]
+    else:
+        # Default to Claude Code
+        full_cmd = [
+            "claude",
+            "--print",
+            "--model", model,
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--allowedTools", "Bash,Read,LS,Glob,Grep,WebFetch,WebSearch",
+            "-p", prompt,
+        ]
 
     stderr_lines: list[str] = []
 
@@ -52,25 +75,16 @@ def _dispatch_one_scout(
 
     try:
         proc = subprocess.Popen(
-            [
-                "claude",
-                "--print",
-                "--model", model,
-                "--strict-mcp-config",  # ignore project .mcp.json -- prevents MCP tool bloat
-                "--no-session-persistence",
-                "--allowedTools", "Bash,Read,LS,Glob,Grep,WebFetch,WebSearch",
-                "--verbose",
-                "-p", prompt,
-            ],
+            full_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=Path.home(),        # neutral cwd -- prevents project CLAUDE.md from loading
+            cwd=Path.home(),
         )
         stderr_thread = threading.Thread(target=_stream_stderr, args=(proc.stderr,), daemon=True)
         stderr_thread.start()
         try:
-            stdout, _ = proc.communicate(timeout=300)
+            stdout, _ = proc.communicate(timeout=600)  # Increased timeout for complex repos
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
@@ -78,7 +92,7 @@ def _dispatch_one_scout(
                 library=candidate.name,
                 repo=candidate.repo_url,
                 version=candidate.version,
-                error="Scout timed out after 300s",
+                error="Scout timed out after 600s",
             )
         stderr_thread.join()
 
@@ -86,31 +100,24 @@ def _dispatch_one_scout(
             return parse_scout_report(stdout)
         else:
             combined = ("".join(stderr_lines) + stdout).lower()
+            error_msg = f"Scout subprocess failed (exit {proc.returncode})"
             if "prompt is too long" in combined:
-                hint = (
-                    f"Scout prompt exceeded {model}'s context limit. "
-                    f"Set scout_model = \"sonnet\" in .towelette/config.toml to use a larger context "
-                    f"(higher token usage)."
-                )
-                return ScoutReport(
-                    library=candidate.name,
-                    repo=candidate.repo_url,
-                    version=candidate.version,
-                    error=hint,
-                )
-            stderr_tail = "".join(stderr_lines)[-200:]
+                error_msg = f"Scout prompt exceeded {model}'s context limit."
+            
+            stderr_tail = "".join(stderr_lines)[-500:]
             return ScoutReport(
                 library=candidate.name,
                 repo=candidate.repo_url,
                 version=candidate.version,
-                error=f"Scout subprocess failed (exit {proc.returncode}): {stderr_tail}",
+                error=f"{error_msg}: {stderr_tail}",
             )
     except FileNotFoundError:
+        agent_name = full_cmd[0]
         return ScoutReport(
             library=candidate.name,
             repo=candidate.repo_url,
             version=candidate.version,
-            error="claude CLI not found -- install Claude Code to dispatch scouts",
+            error=f"Agent CLI '{agent_name}' not found. install {agent_name} or use --agent-cmd to specify a different agent.",
         )
 
 
@@ -157,10 +164,11 @@ def run_scouts(
     imports: dict[str, list[str]] | None = None,
     max_parallel: int = 4,
     model: str | None = None,
+    agent_cmd: str | None = None,
 ) -> list[ScoutReport]:
     """Resolve repo URLs, then dispatch scouts in parallel.
 
-    Each scout is a Claude Code subprocess that clones a repo, explores it,
+    Each scout is an agent CLI subprocess that clones a repo, explores it,
     and returns a TOML report. After all scouts return, upstream dependencies
     are chased one level deep with additional scouts.
 
@@ -180,6 +188,9 @@ def run_scouts(
     # Resolve model from config if not explicitly provided
     config = load_config(towelette_dir)
     scout_model = model or config.get("settings", {}).get("scout_model", "haiku")
+    
+    # Check env for agent cmd if not provided
+    effective_agent_cmd = agent_cmd or os.environ.get("TOWELETTE_AGENT_CMD")
 
     # Load cached reports from previous (possibly crashed) runs
     cached = load_cached_reports(towelette_dir)
@@ -209,6 +220,7 @@ def run_scouts(
                     repos_dir,
                     imports.get(candidate.name, []),
                     scout_model,
+                    effective_agent_cmd,
                 ): candidate
                 for candidate in resolved
             }
@@ -268,6 +280,7 @@ def run_scouts(
                     repos_dir,
                     imports.get(candidate.name, []),
                     scout_model,
+                    effective_agent_cmd,
                 ): candidate
                 for candidate in upstream_resolved
             }
@@ -335,6 +348,7 @@ def _prefix_paths(report: ScoutReport, library_name: str) -> None:
 
     report.source_paths = _do_prefix(report.source_paths)
     report.cpp_paths = _do_prefix(report.cpp_paths)
+    report.doc_paths = _do_prefix(report.doc_paths)
 
 
 def index_from_reports(
@@ -357,10 +371,11 @@ def index_from_reports(
 
         source_paths = [towelette_dir / p for p in report.source_paths]
         cpp_paths = [towelette_dir / p for p in report.cpp_paths]
+        doc_paths = [towelette_dir / p for p in report.doc_paths]
 
         # Detect scouts that described repos via WebFetch without cloning locally.
         # Auto-clone if all source paths are missing and we have a repo URL.
-        all_paths = source_paths + cpp_paths
+        all_paths = source_paths + cpp_paths + doc_paths
         missing = [p for p in all_paths if not p.exists()]
         if missing and len(missing) == len(all_paths):
             clone_dest = towelette_dir / "repos" / report.library
@@ -377,7 +392,8 @@ def index_from_reports(
                     # Refresh path lists after clone
                     source_paths = [towelette_dir / p for p in report.source_paths]
                     cpp_paths = [towelette_dir / p for p in report.cpp_paths]
-                    still_missing = [p for p in source_paths + cpp_paths if not p.exists()]
+                    doc_paths = [towelette_dir / p for p in report.doc_paths]
+                    still_missing = [p for p in source_paths + cpp_paths + doc_paths if not p.exists()]
                     if still_missing:
                         print(f"  WARN {report.library} -- paths still missing after clone: {[p.name for p in still_missing]}", flush=True)
                 else:
@@ -385,43 +401,63 @@ def index_from_reports(
                     continue
 
         total_chunks = 0
+        raw_strategy = report.strategy.lower()
+        strategies = [s.strip() for s in re.split(r"[+,]", raw_strategy)]
 
-        if report.strategy in (IndexStrategy.PYTHON_AST, IndexStrategy.BOTH, "python_ast", "python_ast + tree_sitter_cpp"):
-            paths_to_index = source_paths if source_paths else cpp_paths
-            if paths_to_index:
-                count = index_python_source(
-                    client=client,
-                    collection_name=collection_name,
-                    source=report.library,
-                    source_paths=paths_to_index,
-                    db_path=db_path,
-                    version=report.version,
-                )
-                total_chunks += count
+        core_strategies = {"python_ast", "tree_sitter_cpp", "tree_sitter_rust", "markdown", "both"}
 
-        if report.strategy in (IndexStrategy.TREE_SITTER_CPP, IndexStrategy.BOTH, "tree_sitter_cpp", "python_ast + tree_sitter_cpp"):
-            paths_to_index = cpp_paths if cpp_paths else source_paths
-            if paths_to_index:
-                cpp_collection = (
-                    collection_name
-                    if report.strategy in (IndexStrategy.BOTH, "python_ast + tree_sitter_cpp")
-                    else _sanitize_collection_name(f"{report.library}_code_cpp")
+        for strategy in strategies:
+            if strategy == "python_ast" or strategy == "both":
+                paths = source_paths if source_paths else cpp_paths
+                if paths:
+                    total_chunks += index_python_source(
+                        client=client, collection_name=collection_name,
+                        source=report.library, source_paths=paths,
+                        db_path=db_path, version=report.version,
+                    )
+
+            if strategy == "tree_sitter_cpp" or strategy == "both":
+                paths = cpp_paths if cpp_paths else source_paths
+                if paths:
+                    cpp_col = collection_name if strategy == "both" else _sanitize_collection_name(f"{report.library}_code_cpp")
+                    total_chunks += index_cpp_source(
+                        client=client, collection_name=cpp_col,
+                        source=report.library, source_paths=paths,
+                        db_path=db_path, version=report.version,
+                    )
+
+            if strategy == "tree_sitter_rust":
+                paths = source_paths if source_paths else cpp_paths
+                if paths:
+                    total_chunks += index_rust_source(
+                        client=client, collection_name=collection_name,
+                        source=report.library, source_paths=paths,
+                        db_path=db_path, version=report.version,
+                    )
+
+            if strategy == "markdown":
+                paths = doc_paths if doc_paths else source_paths
+                if paths:
+                    total_chunks += index_markdown_source(
+                        client=client, collection_name=collection_name,
+                        source=report.library, source_paths=paths,
+                        db_path=db_path, version=report.version,
+                    )
+
+            if strategy not in core_strategies:
+                # Custom Plugin strategy
+                total_chunks += index_custom_source(
+                    client=client, collection_name=collection_name,
+                    source=report.library, source_paths=source_paths + doc_paths + cpp_paths,
+                    db_path=db_path, towelette_dir=towelette_dir,
+                    strategy=strategy, version=report.version,
                 )
-                count = index_cpp_source(
-                    client=client,
-                    collection_name=cpp_collection,
-                    source=report.library,
-                    source_paths=paths_to_index,
-                    db_path=db_path,
-                    version=report.version,
-                )
-                total_chunks += count
 
         save_library_config(towelette_dir, report.library, {
             "collection": collection_name,
             "version": report.version or "",
             "strategy": report.strategy,
-            "source_paths": report.source_paths,
+            "source_paths": report.source_paths + report.doc_paths + report.cpp_paths,
         })
 
         results[report.library] = total_chunks

@@ -1,17 +1,17 @@
 """Pydantic models for Towelette data structures."""
 from __future__ import annotations
 
-from enum import Enum
-
 from pydantic import BaseModel, Field
 
 
-class IndexStrategy(str, Enum):
+class IndexStrategy:
     """Indexing strategy for a library."""
 
     PYTHON_AST = "python_ast"
     TREE_SITTER_CPP = "tree_sitter_cpp"
     BOTH = "python_ast + tree_sitter_cpp"
+    MARKDOWN = "markdown"
+    TREE_SITTER_RUST = "tree_sitter_rust"
 
 
 class DependencyCandidate(BaseModel):

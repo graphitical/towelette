@@ -30,6 +30,7 @@ def init(
     skip_scouts: bool = typer.Option(False, "--skip-scouts", help="Skip scout dispatch (discovery only)"),
     only: Optional[str] = typer.Option(None, "--only", help="Comma-separated list of libraries to index (e.g. --only trimesh,open3d,libigl)"),
     report_only: bool = typer.Option(True, "--report/--no-report", help="Print scout report and exit without indexing (default: True)"),
+    agent_cmd: Optional[str] = typer.Option(None, "--agent-cmd", help="Agent command to use for scouting (e.g. 'gemini chat -p')"),
 ):
     """Discover dependencies, analyze each library, and build a searchable RAG index.
 
@@ -105,7 +106,7 @@ def init(
         if cached_names:
             console.print(f"\n[dim]Reusing cached reports: {', '.join(cached_names)}[/dim]")
         console.print(f"\n[bold]Dispatching scouts for: {', '.join(new_names)}...[/bold]")
-        reports = run_scouts(towelette_dir, result.candidates)
+        reports = run_scouts(towelette_dir, result.candidates, agent_cmd=agent_cmd)
 
     # Show scout summary
     summary = format_scout_summary(reports)
@@ -274,6 +275,7 @@ def add(
     repo: Optional[str] = typer.Option(None, "--repo", help="Git repo URL (required for non-PyPI C++ libraries)"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Index immediately without confirmation"),
     path: Optional[str] = typer.Option(None, "--path", help="Project root"),
+    agent_cmd: Optional[str] = typer.Option(None, "--agent-cmd", help="Agent command for scouting"),
 ):
     """Scout a library and optionally index it. Pass -y to index immediately."""
     project_root = _resolve_path(path)
@@ -288,7 +290,7 @@ def add(
 
     console.print(f"\n[bold]Scouting '{library}'...[/bold]")
     candidate = DependencyCandidate(name=library, repo_url=repo)
-    reports = run_scouts(towelette_dir, [candidate])
+    reports = run_scouts(towelette_dir, [candidate], agent_cmd=agent_cmd)
 
     summary = format_scout_summary(reports)
     console.print(f"\n{summary}\n")

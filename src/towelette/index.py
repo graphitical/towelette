@@ -2,11 +2,36 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator, Optional
 
 CHUNK_LIMIT = 8000
 FALLBACK_LIMIT = 5000
+
+
+def load_plugin_indexer(towelette_dir: Path, strategy: str) -> Optional[Any]:
+    """Load a custom indexer plugin from .towelette/plugins/<strategy>_plugin.py.
+
+    The plugin must define:
+    - parse_file(file_path: Path) -> Generator[dict, None, None]
+    - extract_definitions(file_path: Path, source: str) -> list[tuple] (optional)
+    """
+    plugin_path = towelette_dir / "plugins" / f"{strategy}_plugin.py"
+    if not plugin_path.exists():
+        return None
+
+    spec = importlib.util.spec_from_file_location(f"{strategy}_plugin", plugin_path)
+    if spec is None or spec.loader is None:
+        return None
+
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:
+        print(f"  ERR  Failed to load plugin {strategy}: {e}")
+        return None
 
 
 def parse_python_file(file_path: Path) -> Generator[dict, None, None]:
@@ -125,6 +150,8 @@ TARGET_CHUNK_SIZE = 4000
 
 _cpp_parser = None
 _cpp_language = None
+_rust_parser = None
+_rust_language = None
 
 
 def _get_cpp_parser():
@@ -137,6 +164,18 @@ def _get_cpp_parser():
         _cpp_language = Language(tscpp.language())
         _cpp_parser = Parser(_cpp_language)
     return _cpp_parser, _cpp_language
+
+
+def _get_rust_parser():
+    """Lazy-load tree-sitter Rust parser."""
+    global _rust_parser, _rust_language
+    if _rust_parser is None:
+        import tree_sitter_rust as tsrust
+        from tree_sitter import Language, Parser
+
+        _rust_language = Language(tsrust.language())
+        _rust_parser = Parser(_rust_language)
+    return _rust_parser, _rust_language
 
 
 def _get_preceding_comment(source_bytes: bytes, node) -> str:
@@ -272,6 +311,109 @@ def parse_cpp_header(file_path: Path) -> Generator[dict, None, None]:
             }
 
 
+def parse_rust_file(file_path: Path) -> Generator[dict, None, None]:
+    """Parse a Rust file into chunks using tree-sitter."""
+    source = file_path.read_bytes()
+    source_text = source.decode("utf-8", errors="replace")
+
+    try:
+        parser, language = _get_rust_parser()
+    except (ImportError, Exception):
+        yield {
+            "content": source_text[:CHUNK_LIMIT],
+            "class_name": file_path.stem,
+            "chunk_type": "file",
+            "line": 1,
+            "file_path": str(file_path),
+        }
+        return
+
+    tree = parser.parse(source)
+
+    # Simple walk of top-level nodes for Rust
+    for node in tree.root_node.children:
+        if node.type in ("struct_item", "enum_item", "trait_item", "impl_item", "function_item"):
+            name = _extract_rust_name(node)
+            if not name:
+                continue
+
+            comment = _get_preceding_comment(source, node)
+            content = source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+            full_content = f"{comment}\n{content}" if comment else content
+
+            yield {
+                "content": full_content[:CHUNK_LIMIT],
+                "class_name": name,
+                "chunk_type": node.type.replace("_item", ""),
+                "line": node.start_point[0] + 1,
+                "file_path": str(file_path),
+            }
+
+
+def _extract_rust_name(node) -> str | None:
+    """Extract name from a Rust tree-sitter node."""
+    name_node = node.child_by_field_name("name")
+    if name_node:
+        return name_node.text.decode()
+
+    # For impl blocks, it's more complex, use the type name
+    if node.type == "impl_item":
+        type_node = node.child_by_field_name("type")
+        if type_node:
+            return f"impl {type_node.text.decode()}"
+
+    return None
+
+
+def parse_markdown_file(file_path: Path) -> Generator[dict, None, None]:
+    """Parse a Markdown file into chunks based on headers (# ## ###)."""
+    content = file_path.read_text()
+    lines = content.splitlines()
+
+    current_chunk = []
+    current_header = file_path.stem
+    current_line = 1
+
+    header_pattern = re.compile(r"^(#+)\s+(.*)")
+
+    for i, line in enumerate(lines):
+        match = header_pattern.match(line)
+        if match:
+            if current_chunk:
+                yield {
+                    "content": "\n".join(current_chunk)[:CHUNK_LIMIT],
+                    "class_name": current_header,
+                    "chunk_type": "markdown_section",
+                    "line": current_line,
+                    "file_path": str(file_path),
+                }
+            current_chunk = [line]
+            current_header = match.group(2)
+            current_line = i + 1
+        else:
+            current_chunk.append(line)
+            # If chunk gets too large, split it
+            if len("\n".join(current_chunk)) > CHUNK_LIMIT:
+                yield {
+                    "content": "\n".join(current_chunk)[:CHUNK_LIMIT],
+                    "class_name": current_header,
+                    "chunk_type": "markdown_section",
+                    "line": current_line,
+                    "file_path": str(file_path),
+                }
+                current_chunk = []
+                current_line = i + 1
+
+    if current_chunk:
+        yield {
+            "content": "\n".join(current_chunk)[:CHUNK_LIMIT],
+            "class_name": current_header,
+            "chunk_type": "markdown_section",
+            "line": current_line,
+            "file_path": str(file_path),
+        }
+
+
 def _extract_function_name(node) -> str | None:
     """Extract the function/declaration name from a tree-sitter node."""
     declarator = node.child_by_field_name("declarator")
@@ -344,6 +486,44 @@ def extract_cpp_definitions(
             name = _extract_function_name(node)
             if name:
                 defs.append((source, name, name, rel_path, node.start_point[0] + 1, "function", None))
+
+    return defs
+
+
+def extract_rust_definitions(
+    file_path: Path,
+    source: str,
+) -> list[tuple]:
+    """Extract symbol definitions from a Rust file for the definitions DB."""
+    file_source = file_path.read_bytes()
+
+    try:
+        parser, language = _get_rust_parser()
+    except (ImportError, Exception):
+        return []
+
+    tree = parser.parse(file_source)
+    defs: list[tuple] = []
+    rel_path = str(file_path)
+
+    for node in tree.root_node.children:
+        if node.type in ("struct_item", "enum_item", "trait_item", "impl_item", "function_item"):
+            name = _extract_rust_name(node)
+            if not name:
+                continue
+            kind = node.type.replace("_item", "")
+            defs.append((source, name, name, rel_path, node.start_point[0] + 1, kind, None))
+
+            # Recurse into impl/trait bodies for methods
+            if node.type in ("impl_item", "trait_item"):
+                body = node.child_by_field_name("body")
+                if body:
+                    for child in body.children:
+                        if child.type == "function_item":
+                            method_name = _extract_rust_name(child)
+                            if method_name:
+                                qualified = f"{name}::{method_name}"
+                                defs.append((source, method_name, qualified, rel_path, child.start_point[0] + 1, "method", name))
 
     return defs
 
@@ -503,6 +683,241 @@ def index_cpp_source(
                 chunk_idx += 1
 
             all_definitions.extend(extract_cpp_definitions(cpp_file, source=source))
+
+    for i in range(0, len(all_docs), BATCH_SIZE):
+        batch_end = min(i + BATCH_SIZE, len(all_docs))
+        collection.add(
+            documents=all_docs[i:batch_end],
+            ids=all_ids[i:batch_end],
+            metadatas=all_metadatas[i:batch_end],
+        )
+
+    if all_definitions:
+        conn = create_db(db_path)
+        clear_source(conn, source)
+        insert_definitions(conn, all_definitions)
+        conn.close()
+
+    return len(all_docs)
+
+
+def index_rust_source(
+    client: chromadb.ClientAPI,
+    collection_name: str,
+    source: str,
+    source_paths: list[Path],
+    db_path: Path,
+    version: str | None = None,
+    file_extensions: tuple[str, ...] = (".rs",),
+    skip_dirs: set[str] | None = None,
+) -> int:
+    """Index Rust source files into ChromaDB and definitions DB.
+
+    Returns the number of chunks inserted.
+    """
+    if skip_dirs is None:
+        skip_dirs = {".git", "target", "tests", "examples"}
+
+    ef = get_embedding_function()
+    metadata = {"source": source}
+    if version:
+        metadata["version"] = version
+
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        embedding_function=ef,
+        metadata=metadata,
+    )
+
+    all_docs: list[str] = []
+    all_ids: list[str] = []
+    all_metadatas: list[dict] = []
+    all_definitions: list[tuple] = []
+
+    chunk_idx = 0
+    for src_path in source_paths:
+        if src_path.is_file():
+            rs_files = [src_path] if src_path.suffix in file_extensions else []
+        else:
+            rs_files = [
+                f for f in src_path.rglob("*")
+                if f.suffix in file_extensions
+                and not any(part in skip_dirs for part in f.parts)
+            ]
+
+        for rs_file in sorted(rs_files):
+            rel_path = str(rs_file.relative_to(src_path)) if src_path.is_dir() else rs_file.name
+
+            for chunk in parse_rust_file(rs_file):
+                doc_id = f"{source}_rs_{chunk_idx}"
+                all_docs.append(chunk["content"])
+                all_ids.append(doc_id)
+                all_metadatas.append({
+                    "source": source,
+                    "file_path": rel_path,
+                    "class_name": chunk["class_name"],
+                    "chunk_type": chunk["chunk_type"],
+                })
+                chunk_idx += 1
+
+            all_definitions.extend(extract_rust_definitions(rs_file, source=source))
+
+    for i in range(0, len(all_docs), BATCH_SIZE):
+        batch_end = min(i + BATCH_SIZE, len(all_docs))
+        collection.add(
+            documents=all_docs[i:batch_end],
+            ids=all_ids[i:batch_end],
+            metadatas=all_metadatas[i:batch_end],
+        )
+
+    if all_definitions:
+        conn = create_db(db_path)
+        clear_source(conn, source)
+        insert_definitions(conn, all_definitions)
+        conn.close()
+
+    return len(all_docs)
+
+
+def index_markdown_source(
+    client: chromadb.ClientAPI,
+    collection_name: str,
+    source: str,
+    source_paths: list[Path],
+    db_path: Path,
+    version: str | None = None,
+    file_extensions: tuple[str, ...] = (".md", ".markdown", ".kcl"),
+    skip_dirs: set[str] | None = None,
+) -> int:
+    """Index Markdown/text files into ChromaDB.
+
+    Returns the number of chunks inserted.
+    """
+    if skip_dirs is None:
+        skip_dirs = {".git", "node_modules"}
+
+    ef = get_embedding_function()
+    metadata = {"source": source}
+    if version:
+        metadata["version"] = version
+
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        embedding_function=ef,
+        metadata=metadata,
+    )
+
+    all_docs: list[str] = []
+    all_ids: list[str] = []
+    all_metadatas: list[dict] = []
+
+    chunk_idx = 0
+    for src_path in source_paths:
+        if src_path.is_file():
+            md_files = [src_path] if src_path.suffix in file_extensions else []
+        else:
+            md_files = [
+                f for f in src_path.rglob("*")
+                if f.suffix in file_extensions
+                and not any(part in skip_dirs for part in f.parts)
+            ]
+
+        for md_file in sorted(md_files):
+            rel_path = str(md_file.relative_to(src_path)) if src_path.is_dir() else md_file.name
+
+            for chunk in parse_markdown_file(md_file):
+                doc_id = f"{source}_md_{chunk_idx}"
+                all_docs.append(chunk["content"])
+                all_ids.append(doc_id)
+                all_metadatas.append({
+                    "source": source,
+                    "file_path": rel_path,
+                    "class_name": chunk["class_name"],
+                    "chunk_type": chunk["chunk_type"],
+                })
+                chunk_idx += 1
+
+    for i in range(0, len(all_docs), BATCH_SIZE):
+        batch_end = min(i + BATCH_SIZE, len(all_docs))
+        collection.add(
+            documents=all_docs[i:batch_end],
+            ids=all_ids[i:batch_end],
+            metadatas=all_metadatas[i:batch_end],
+        )
+
+    return len(all_docs)
+
+
+def index_custom_source(
+    client: chromadb.ClientAPI,
+    collection_name: str,
+    source: str,
+    source_paths: list[Path],
+    db_path: Path,
+    towelette_dir: Path,
+    strategy: str,
+    version: str | None = None,
+) -> int:
+    """Index source files using a custom plugin indexer."""
+    plugin = load_plugin_indexer(towelette_dir, strategy)
+    if not plugin:
+        print(f"  ERR  No plugin found for strategy '{strategy}'")
+        return 0
+
+    parse_func = getattr(plugin, "parse_file", None)
+    if not parse_func:
+        print(f"  ERR  Plugin '{strategy}' missing 'parse_file' function")
+        return 0
+
+    extract_defs_func = getattr(plugin, "extract_definitions", None)
+
+    ef = get_embedding_function()
+    metadata = {"source": source, "strategy": strategy}
+    if version:
+        metadata["version"] = version
+
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        embedding_function=ef,
+        metadata=metadata,
+    )
+
+    all_docs: list[str] = []
+    all_ids: list[str] = []
+    all_metadatas: list[dict] = []
+    all_definitions: list[tuple] = []
+
+    chunk_idx = 0
+    for src_path in source_paths:
+        files = [src_path] if src_path.is_file() else sorted(src_path.rglob("*"))
+        for f in files:
+            if not f.is_file() or ".git" in f.parts or "__pycache__" in f.parts:
+                continue
+
+            rel_path = str(f.relative_to(src_path)) if src_path.is_dir() else f.name
+
+            try:
+                for chunk in parse_func(f):
+                    doc_id = f"{source}_{strategy}_{chunk_idx}"
+                    all_docs.append(chunk["content"])
+                    all_ids.append(doc_id)
+                    meta = {
+                        "source": source,
+                        "file_path": rel_path,
+                        "class_name": chunk.get("class_name", f.stem),
+                        "chunk_type": chunk.get("chunk_type", "custom"),
+                        "symbols": chunk.get("symbols", ""),
+                    }
+                    all_metadatas.append(meta)
+                    chunk_idx += 1
+            except Exception as e:
+                print(f"  ERR  Plugin {strategy} failed parsing {f}: {e}")
+
+            if extract_defs_func:
+                try:
+                    all_definitions.extend(extract_defs_func(f, source=source))
+                except Exception as e:
+                    print(f"  ERR  Plugin {strategy} failed extracting definitions from {f}: {e}")
 
     for i in range(0, len(all_docs), BATCH_SIZE):
         batch_end = min(i + BATCH_SIZE, len(all_docs))

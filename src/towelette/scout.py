@@ -68,8 +68,8 @@ The project imports: {imports_str}{clone_dest}
 Your job:
 {clone_instruction}
 2. Explore the directory structure
-3. Identify: Python source paths, C/C++ binding paths, doc paths
-4. Recommend an indexing strategy (python_ast, tree_sitter_cpp, or python_ast + tree_sitter_cpp)
+3. Identify: Python source paths, C/C++ binding paths, Rust source paths, doc paths
+4. Recommend an indexing strategy (python_ast, tree_sitter_cpp, tree_sitter_rust, or markdown)
 5. Identify files/dirs to skip (tests, examples, CI, build scripts)
 6. Check for significant upstream dependencies (dependency chasing -- one level deep only)
 7. Return a structured TOML report in this exact format:
@@ -79,7 +79,7 @@ Your job:
 library = "{candidate.name}"
 repo = "<repo_url or empty string>"
 version = "{version_str}"
-strategy = "<python_ast | tree_sitter_cpp | python_ast + tree_sitter_cpp>"
+strategy = "<python_ast | tree_sitter_cpp | tree_sitter_rust | markdown | custom_plugin_name>"
 source_paths = ["<path1>", "<path2>"]
 cpp_paths = ["<path1>"]
 doc_paths = ["<path1>"]
@@ -99,12 +99,17 @@ Rules:
 - You are running non-interactively. Execute all operations directly -- do not ask for permission or confirmation before running any command.
 - You MUST clone or download the repo locally before writing your report. Do not describe the repo using WebFetch/GitHub alone -- the local clone is required for indexing.
 - source_paths and cpp_paths should be relative to the repo root
-- VERIFY every path you put in source_paths and cpp_paths actually exists with `ls <clone_dest>/<path>` before writing the report. Do not guess paths from GitHub -- confirm them locally.
+- doc_paths should contain Markdown files or other documentation/examples
+- VERIFY every path you put in source_paths, cpp_paths, and doc_paths actually exists with `ls <clone_dest>/<path>` before writing the report. Do not guess paths from GitHub -- confirm them locally.
+- Strategy heuristics: 
+  - .py files -> python_ast
+  - .h/.hpp/.hxx/.cpp/.cc -> tree_sitter_cpp
+  - .rs files -> tree_sitter_rust
+  - .md/.markdown -> markdown
+  - For niche languages, recommend a "custom_<name>" strategy and briefly explain the language in notes.
 - Watch for src-layout packages (pyproject.toml with `packages = [{{include = "foo", from = "src"}}]`) -- the Python source will be under `src/foo/`, not `foo/`.
 - Only include [[upstream_dependencies]] if you find significant upstream deps with domain logic
 - Skip Eigen, Boost, STL, numpy, etc. as upstream deps -- only recommend libs with unique domain logic
-- Strategy heuristics: .py files -> python_ast, .h/.hpp/.hxx/.cpp/.cc -> tree_sitter_cpp, both + pybind11/SWIG/nanobind -> both
-- Skip tests, examples, CI, build scripts, docs (unless API reference)
 - Return ONLY the TOML report block in your final response
 """
 
