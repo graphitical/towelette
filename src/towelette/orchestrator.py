@@ -23,6 +23,7 @@ from pathlib import Path
 import chromadb
 
 from towelette.config import load_config, save_library_config
+from towelette.discover import resolve_candidates
 from towelette.index import (
     index_cpp_source,
     index_custom_source,
@@ -177,8 +178,6 @@ def run_scouts(
 
     Returns list of ScoutReports for all candidates + discovered upstreams.
     """
-    from towelette.discover import resolve_candidates
-
     if imports is None:
         imports = {}
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -152,7 +153,7 @@ class TestDispatchOneScout:
             report = _dispatch_one_scout(candidate, Path("/tmp/repos"), [])
 
         assert report.error is not None
-        assert "claude CLI not found" in report.error
+        assert "Agent CLI 'claude' not found" in report.error
 
 
 class TestRunScouts:
@@ -178,7 +179,7 @@ class TestRunScouts:
         trimesh_report = ScoutReport(library="trimesh", strategy="python_ast", source_paths=["trimesh/"], estimated_chunks=800)
         mylib_report = ScoutReport(library="mylib", strategy="python_ast", source_paths=["mylib/"], estimated_chunks=50)
 
-        def fake_dispatch(candidate, repos_dir, imports):
+        def fake_dispatch(candidate, repos_dir, imports, model="haiku", agent_cmd=None):
             if candidate.name == "trimesh":
                 return trimesh_report
             return mylib_report
@@ -223,7 +224,7 @@ class TestRunScouts:
 
         call_count = {"n": 0}
 
-        def fake_dispatch(candidate, repos_dir, imports, model="haiku"):
+        def fake_dispatch(candidate, repos_dir, imports, model="haiku", agent_cmd=None):
             call_count["n"] += 1
             if candidate.name == "potpourri3d":
                 return potpourri_report
@@ -235,13 +236,13 @@ class TestRunScouts:
         )
         asyncio_call = {"n": 0}
 
-        def fake_asyncio_run(coro):
+        async def fake_resolve(cands):
             asyncio_call["n"] += 1
             if asyncio_call["n"] == 1:
                 return candidates
             return [upstream_candidate]
 
-        with patch("towelette.orchestrator.asyncio.run", side_effect=fake_asyncio_run), \
+        with patch("towelette.orchestrator.resolve_candidates", side_effect=fake_resolve), \
              patch("towelette.orchestrator._dispatch_one_scout", side_effect=fake_dispatch):
             reports = run_scouts(towelette_dir, candidates)
 
@@ -273,11 +274,14 @@ class TestRunScouts:
 
         call_count = {"n": 0}
 
-        def fake_dispatch(candidate, repos_dir, imports, model="haiku"):
+        def fake_dispatch(candidate, repos_dir, imports, model="haiku", agent_cmd=None):
             call_count["n"] += 1
             return somelib_report
 
-        with patch("towelette.orchestrator.asyncio.run", side_effect=lambda coro: candidates), \
+        async def fake_resolve(cands):
+            return candidates
+
+        with patch("towelette.orchestrator.resolve_candidates", side_effect=fake_resolve), \
              patch("towelette.orchestrator._dispatch_one_scout", side_effect=fake_dispatch):
             reports = run_scouts(towelette_dir, candidates)
 
@@ -309,11 +313,14 @@ class TestRunScouts:
 
         call_count = {"n": 0}
 
-        def fake_dispatch(candidate, repos_dir, imports, model="haiku"):
+        def fake_dispatch(candidate, repos_dir, imports, model="haiku", agent_cmd=None):
             call_count["n"] += 1
             return somelib_report
 
-        with patch("towelette.orchestrator.asyncio.run", side_effect=lambda coro: candidates), \
+        async def fake_resolve(cands):
+            return candidates
+
+        with patch("towelette.orchestrator.resolve_candidates", side_effect=fake_resolve), \
              patch("towelette.orchestrator._dispatch_one_scout", side_effect=fake_dispatch):
             reports = run_scouts(towelette_dir, candidates)
 
