@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "towelette"
-version = "0.1.0"
+version = "0.2.0"
 description = "A tiny RAG to wipe away API hallucinations"
 readme = "README.md"
 license = "MIT"
